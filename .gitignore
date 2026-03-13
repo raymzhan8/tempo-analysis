@@ -1,0 +1,8 @@
+# Dataset
+maestro-v3.0.0/
+
+# Python cache
+__pycache__/
+
+# Large prior files
+priors/piece_local_hist.pkl
