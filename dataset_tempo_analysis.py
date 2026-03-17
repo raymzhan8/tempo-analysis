@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 IOI_CANDIDATE_KEYS = [
     "ioi",
@@ -57,6 +58,11 @@ def find_ioi_array(song: dict) -> np.ndarray | None:
 
 
 def find_note_length_array(song: dict) -> np.ndarray | None:
+    # Prefer note_length_histogram (per-note durations) over candidate keys like duration_sec
+    # (segment duration), which would wrongly return a single scalar.
+    hist = song.get("note_length_histogram")
+    if isinstance(hist, dict) and hist.get("counts"):
+        return extract_array_from_histogram(hist, min_val=0.0)
     for key in NOTE_LENGTH_CANDIDATE_KEYS:
         if key not in song:
             continue
@@ -69,9 +75,6 @@ def find_note_length_array(song: dict) -> np.ndarray | None:
                 return arr
         except (TypeError, ValueError):
             continue
-    hist = song.get("note_length_histogram")
-    if isinstance(hist, dict):
-        return extract_array_from_histogram(hist, min_val=0.0)
     return None
 
 
@@ -228,9 +231,10 @@ def main() -> int:
     script_dir = Path(__file__).resolve().parent
     parent_dir = script_dir.parent
 
+    # Prefer public_html (pipeline output) over script_dir
     tempo_candidates = [
-        script_dir / "tempo_labels.json",
         parent_dir / "public_html" / "tempo_labels.json",
+        script_dir / "tempo_labels.json",
     ]
     dist_candidates = [
         parent_dir / "public_html" / "per_song_distributions.json",
@@ -276,10 +280,10 @@ def main() -> int:
     if unmatched_dist:
         print(f"Distribution entries without matching tempo label: {len(unmatched_dist)}")
 
-    by_label = aggregate_by_label(matched)
+    by_label = aggregate_by_label(tqdm(matched, desc="Aggregating by label", unit="song"))
 
     tempo_class_csv_rows = []
-    for m in matched:
+    for m in tqdm(matched, desc="Analyzing tempo classes", unit="song"):
         tempo = m["tempo"]
         dist = m["dist"]
         label = tempo.get("tempo_label")

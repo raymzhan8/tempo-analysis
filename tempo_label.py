@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 IOI_CANDIDATE_KEYS = [
     "ioi",
@@ -236,7 +237,7 @@ def main() -> int:
         return 1
 
     results = []
-    for idx, song in songs_with_index:
+    for idx, song in tqdm(songs_with_index, desc="Labeling tempo", unit="song"):
         try:
             r = process_song(song, idx)
             results.append(r)

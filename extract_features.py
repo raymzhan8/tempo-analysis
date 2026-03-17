@@ -14,9 +14,11 @@ from pathlib import Path
 
 import mido
 import pandas as pd
+from tqdm import tqdm
 
 # Path to MAESTRO dataset (relative to this script)
 MAESTRO_CSV = Path(__file__).resolve().parent / "maestro-v3.0.0" / "maestro-v3.0.0.csv"
+MAESTRO_SPLITS_CSV = Path(__file__).resolve().parent / "maestro_splits.csv"
 MAESTRO_DIR = Path(__file__).resolve().parent / "maestro-v3.0.0"
 OUTPUT_JSON = Path(__file__).resolve().parent.parent / "public_html" / "maestro_data.json"
 OUTPUT_DISTRIBUTIONS_JSON = Path(__file__).resolve().parent.parent / "public_html" / "per_song_distributions.json"
@@ -31,8 +33,9 @@ MAX_DURATION_SEC = 2.5
 MIN_IOI_FOR_INV = 0.01
 INV_IOI_BIN = 5.0
 MAX_INV_IOI = 1200.0
-# Tempo-over-time: window size in seconds
+# Tempo-over-time: window sizes (60s/30s step, 30s/15s step)
 TEMPO_WINDOW_SEC = 60.0
+TEMPO_WINDOW_SEC_30 = 30.0
 
 
 def get_all_notes(midi: mido.MidiFile) -> list[dict]:
@@ -108,9 +111,13 @@ def compute_tempo_over_time(
         if window_iois:
             med = statistics.median(window_iois)
             tempo.append(round(60 / med, 2))
-            q = statistics.quantiles(window_iois, n=10)
-            p80 = q[7] if len(q) >= 8 else med
-            p90 = q[8] if len(q) >= 9 else med
+            if len(window_iois) >= 2:
+                q = statistics.quantiles(window_iois, n=10)
+                p80 = q[7] if len(q) >= 8 else med
+                p90 = q[8] if len(q) >= 9 else med
+            else:
+                p80 = med
+                p90 = med
             tempo_p80.append(round(60 / p80, 2))
             tempo_p90.append(round(60 / p90, 2))
         else:
@@ -122,9 +129,14 @@ def compute_tempo_over_time(
     return {"window_sec": window_sec, "times": times, "tempo": tempo, "tempo_p80": tempo_p80, "tempo_p90": tempo_p90}
 
 
-def extract_song_distributions(midi_path: Path) -> dict | None:
+def extract_song_distributions(
+    midi_path: Path,
+    start_sec: float | None = None,
+    end_sec: float | None = None,
+) -> dict | None:
     """
-    Extract IOI and note length distributions for a single MIDI file.
+    Extract IOI and note length distributions for a MIDI file or segment.
+    When start_sec/end_sec are provided, filter notes to that time range.
     Returns dict with ioi_histogram, note_length_histogram, and summary stats.
     """
     if not midi_path.exists():
@@ -135,6 +147,12 @@ def extract_song_distributions(midi_path: Path) -> dict | None:
         return None
     notes = get_all_notes(midi)
     if not notes:
+        return None
+
+    # Clip to segment when start_sec/end_sec provided
+    if start_sec is not None and end_sec is not None:
+        notes = [n for n in notes if start_sec <= n["start_sec"] < end_sec]
+    if len(notes) < 2:
         return None
 
     # Note lengths (duration of each note)
@@ -152,7 +170,8 @@ def extract_song_distributions(midi_path: Path) -> dict | None:
     if not inv_iois:
         inv_iois = [0.0]
 
-    tempo_over_time = compute_tempo_over_time(onset_times)
+    tempo_over_time = compute_tempo_over_time(onset_times, window_sec=TEMPO_WINDOW_SEC)
+    tempo_over_time_30 = compute_tempo_over_time(onset_times, window_sec=TEMPO_WINDOW_SEC_30)
 
     return {
         "num_notes": len(notes),
@@ -164,6 +183,7 @@ def extract_song_distributions(midi_path: Path) -> dict | None:
         "ioi_stats": {
             "mean": round(statistics.mean(iois), 4),
             "median": round(statistics.median(iois), 4),
+            "p90": round(statistics.quantiles(iois, n=10)[8], 4) if len(iois) >= 2 else round(statistics.median(iois), 4),
             "min": round(min(iois), 4),
             "max": round(max(iois), 4),
         },
@@ -176,74 +196,116 @@ def extract_song_distributions(midi_path: Path) -> dict | None:
         "note_length_stats": {
             "mean": round(statistics.mean(note_lengths), 4),
             "median": round(statistics.median(note_lengths), 4),
+            "p90": round(statistics.quantiles(note_lengths, n=10)[8], 4) if len(note_lengths) >= 2 else round(statistics.median(note_lengths), 4),
             "min": round(min(note_lengths), 4),
             "max": round(max(note_lengths), 4),
         },
         "tempo_over_time": tempo_over_time,
+        "tempo_over_time_30": tempo_over_time_30,
     }
 
 
-def extract_per_song_distributions(df: pd.DataFrame, max_songs: int = 10) -> list[dict]:
+def extract_per_song_distributions(
+    df: pd.DataFrame,
+    max_songs: int = 10,
+    use_splits: bool = False,
+) -> list[dict]:
     """Extract IOI and note length distributions for the first max_songs files. Use max_songs=0 for all."""
     n = len(df) if max_songs <= 0 else min(max_songs, len(df))
+    has_segments = use_splits and "start_sec" in df.columns and "end_sec" in df.columns
     results = []
-    for idx in range(n):
+    for idx in tqdm(range(n), desc="Extracting distributions", unit="song"):
         row = df.iloc[idx]
         midi_path = MAESTRO_DIR / row["midi_filename"]
-        dist = extract_song_distributions(midi_path)
+        start_sec = float(row["start_sec"]) if has_segments and pd.notna(row.get("start_sec")) else None
+        end_sec = float(row["end_sec"]) if has_segments and pd.notna(row.get("end_sec")) else None
+        dist = extract_song_distributions(midi_path, start_sec=start_sec, end_sec=end_sec)
+        midi_filename = str(row["midi_filename"])
+        if has_segments and start_sec is not None and end_sec is not None:
+            song_id = f"{midi_filename}|{start_sec}|{end_sec}"
+        else:
+            song_id = midi_filename
         if dist is None:
             results.append({
                 "index": idx,
+                "song_id": song_id,
                 "composer": str(row["canonical_composer"]),
                 "title": str(row["canonical_title"]),
-                "midi_filename": str(row["midi_filename"]),
+                "midi_filename": midi_filename,
+                "split": str(row["split"]) if has_segments else None,
+                "year": int(row["year"]) if has_segments and pd.notna(row.get("year")) else None,
+                "duration_sec": round(float(row["segment_duration"]), 2) if has_segments else None,
+                "audio_filename": str(row["audio_filename"]) if has_segments else None,
                 "error": "Failed to load or empty MIDI",
             })
             continue
-        results.append({
+        entry = {
             "index": idx,
+            "song_id": song_id,
             "composer": str(row["canonical_composer"]),
             "title": str(row["canonical_title"]),
-            "midi_filename": str(row["midi_filename"]),
+            "midi_filename": midi_filename,
             **dist,
-        })
+        }
+        if has_segments:
+            entry["split"] = str(row["split"])
+            entry["year"] = int(row["year"]) if pd.notna(row.get("year")) else None
+            entry["duration_sec"] = round(float(row["segment_duration"]), 2)
+            entry["audio_filename"] = str(row["audio_filename"])
+        results.append(entry)
     return results
 
 
-def load_maestro() -> pd.DataFrame:
+def load_maestro(csv_path: Path | None = None) -> pd.DataFrame:
     """Load and validate the MAESTRO dataset."""
-    df = pd.read_csv(MAESTRO_CSV)
+    path = csv_path or MAESTRO_CSV
+    df = pd.read_csv(path)
     # Ensure duration is numeric
     df["duration"] = pd.to_numeric(df["duration"], errors="coerce")
     df = df.dropna(subset=["duration"])
+    # When using splits, validate start_sec/end_sec and compute segment_duration
+    if "start_sec" in df.columns and "end_sec" in df.columns:
+        df["start_sec"] = pd.to_numeric(df["start_sec"], errors="coerce")
+        df["end_sec"] = pd.to_numeric(df["end_sec"], errors="coerce")
+        df["segment_duration"] = df["end_sec"] - df["start_sec"]
     return df
 
 
-def extract_features(df: pd.DataFrame) -> dict:
+def extract_features(df: pd.DataFrame, use_splits: bool = False) -> dict:
     """Extract summary features and per-recording data from MAESTRO."""
+    # Use segment_duration when splits (segment-level); else full file duration
+    dur_col = "segment_duration" if (use_splits and "segment_duration" in df.columns) else "duration"
+    duration_vals = df[dur_col]
+
     # Per-recording rows for the table (lightweight)
+    has_segments = use_splits and "start_sec" in df.columns and "end_sec" in df.columns
     records = []
-    for i, (_, row) in enumerate(df.iterrows()):
+    for i, (_, row) in enumerate(tqdm(df.iterrows(), total=len(df), desc="Extracting features", unit="rec")):
+        midi_filename = str(row["midi_filename"])
+        start_sec = float(row["start_sec"]) if has_segments and pd.notna(row.get("start_sec")) else None
+        end_sec = float(row["end_sec"]) if has_segments and pd.notna(row.get("end_sec")) else None
+        song_id = f"{midi_filename}|{start_sec}|{end_sec}" if (start_sec is not None and end_sec is not None) else midi_filename
         records.append({
             "index": i,
+            "song_id": song_id,
             "composer": str(row["canonical_composer"]),
             "title": str(row["canonical_title"]),
             "split": str(row["split"]),
             "year": int(row["year"]) if pd.notna(row["year"]) else None,
-            "duration_sec": round(float(row["duration"]), 2),
-            "midi_filename": str(row["midi_filename"]),
+            "duration_sec": round(float(row[dur_col]), 2),
+            "midi_filename": midi_filename,
             "audio_filename": str(row["audio_filename"]),
         })
 
     # Summary stats
     summary = {
         "total_recordings": len(df),
-        "total_duration_hours": round(df["duration"].sum() / 3600, 2),
+        "total_duration_hours": round(duration_vals.sum() / 3600, 2),
         "duration_sec": {
-            "min": round(float(df["duration"].min()), 2),
-            "max": round(float(df["duration"].max()), 2),
-            "mean": round(float(df["duration"].mean()), 2),
-            "median": round(float(df["duration"].median()), 2),
+            "min": round(float(duration_vals.min()), 2),
+            "max": round(float(duration_vals.max()), 2),
+            "mean": round(float(duration_vals.mean()), 2),
+            "median": round(float(duration_vals.median()), 2),
         },
         "by_split": df["split"].value_counts().to_dict(),
         "by_year": df["year"].value_counts().sort_index().to_dict(),
@@ -255,8 +317,9 @@ def extract_features(df: pd.DataFrame) -> dict:
     # Histogram bins for duration distribution
     duration_bins = [0, 60, 120, 180, 300, 600, 900, 1200, 1800, float("inf")]
     duration_labels = ["0-1min", "1-2min", "2-3min", "3-5min", "5-10min", "10-15min", "15-20min", "20-30min", "30min+"]
-    df["duration_bin"] = pd.cut(df["duration"], bins=duration_bins, labels=duration_labels)
-    summary["duration_distribution"] = df["duration_bin"].value_counts().reindex(duration_labels, fill_value=0).to_dict()
+    df_copy = df.copy()
+    df_copy["duration_bin"] = pd.cut(duration_vals, bins=duration_bins, labels=duration_labels)
+    summary["duration_distribution"] = df_copy["duration_bin"].value_counts().reindex(duration_labels, fill_value=0).to_dict()
 
     return {
         "summary": summary,
@@ -268,23 +331,29 @@ def main():
     parser = argparse.ArgumentParser(description="Extract MAESTRO features and per-song distributions")
     parser.add_argument("--distributions-only", action="store_true", help="Only extract per-song IOI/note-length distributions")
     parser.add_argument("--max-songs", type=int, default=10, help="Number of songs for distribution extraction (default: 10). Use 0 for all songs.")
+    parser.add_argument("--splits", action="store_true", help="Use maestro_splits.csv (segment-level) instead of maestro-v3.0.0.csv")
     args = parser.parse_args()
 
-    df = load_maestro()
+    csv_path = MAESTRO_SPLITS_CSV if args.splits else MAESTRO_CSV
+    if args.splits and not csv_path.exists():
+        raise SystemExit(f"Error: {csv_path} not found. Run without --splits to use maestro-v3.0.0.csv")
+    df = load_maestro(csv_path=csv_path)
 
-    if not args.distributions_only:
-        features = extract_features(df)
-        OUTPUT_JSON.parent.mkdir(parents=True, exist_ok=True)
-        with open(OUTPUT_JSON, "w") as f:
-            json.dump(features, f, indent=2)
-        print(f"Wrote {OUTPUT_JSON} ({len(features['records'])} recordings)")
+    # Always extract features (maestro_data.json) so Recordings table reflects splits when used
+    features = extract_features(df, use_splits=args.splits)
+    OUTPUT_JSON.parent.mkdir(parents=True, exist_ok=True)
+    with open(OUTPUT_JSON, "w") as f:
+        json.dump(features, f, indent=2)
+    label = "segments" if args.splits else "recordings"
+    print(f"Wrote {OUTPUT_JSON} ({len(features['records'])} {label})")
 
     # Per-song IOI and note length distributions
-    distributions = extract_per_song_distributions(df, max_songs=args.max_songs)
+    distributions = extract_per_song_distributions(df, max_songs=args.max_songs, use_splits=args.splits)
     OUTPUT_DISTRIBUTIONS_JSON.parent.mkdir(parents=True, exist_ok=True)
     with open(OUTPUT_DISTRIBUTIONS_JSON, "w") as f:
         json.dump({"songs": distributions, "params": {"bin_sec": IOI_BIN_SEC, "max_ioi_sec": MAX_IOI_SEC, "max_duration_sec": MAX_DURATION_SEC}}, f, indent=2)
-    print(f"Wrote {OUTPUT_DISTRIBUTIONS_JSON} ({len(distributions)} songs)")
+    label = "segments" if args.splits else "songs"
+    print(f"Wrote {OUTPUT_DISTRIBUTIONS_JSON} ({len(distributions)} {label})")
 
 
 if __name__ == "__main__":
